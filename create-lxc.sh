@@ -13,7 +13,7 @@ DEFAULT_ROOTFS="32"
 DEFAULT_CORES="8"
 DEFAULT_MEMORY_MB="16384"
 DEFAULT_MEMORY_GB="16"
-DEFAULT_HOSTNAME_PREFIX="ai-engine"
+DEFAULT_HOSTNAME_PREFIX="test"
 
 usage() {
   cat <<'EOF'
@@ -25,13 +25,14 @@ Non-interactive: pass flags.
 Options:
   --vmid ID                 LXC ID (>=100, Proxmox requires 100+)
   --ip IP                   192.168.1.X or 192.168.1.X/24 or just X (e.g. 50 -> 192.168.1.50/24)
-  --hostname NAME           Container hostname (default: ai-engine-<vmid>)
+  --hostname NAME           Container hostname (default: test-<vmid>)
   --privileged / --unprivileged  privileged=1 for performance/LLM (default: prompt, privileged=yes)
   --password PASS           root password (otherwise prompted securely)
   --gpu MODE                amd|nvidia|both|none|auto (default: auto=both if devices exist)
-  --cores N                 CPU cores (default: 8)
+  --cores N                 CPU cores (default: 8 — options 2/4/8/12)
   --memory GB|MB            RAM — GB choices 4/8/12/16/32 (default: 16GB). Accepts 16, 16GB, or 16384
   --storage POOL            Proxmox storage (default: RaidZ1-6TB — like hlh-ai-engine)
+  --rootfs GB               Rootfs size in GB (options 16/32/64/128, default: 32G)
   --template TPL            Template (default: local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst)
   --bridge BR               Bridge (default: vmbr0)
   -h, --help                Show this help
@@ -54,6 +55,7 @@ PASSWORD=""
 GPU_MODE="auto"
 CORES="$DEFAULT_CORES"
 MEMORY="$DEFAULT_MEMORY_MB"
+ROOTFS="$DEFAULT_ROOTFS"
 STORAGE="$DEFAULT_STORAGE"
 TEMPLATE="$DEFAULT_TEMPLATE"
 BRIDGE_OPT="$BRIDGE"
@@ -70,6 +72,7 @@ while [[ $# -gt 0 ]]; do
     --cores) CORES="$2"; shift 2 ;;
     --memory) MEMORY="$2"; shift 2 ;;
     --storage) STORAGE="$2"; shift 2 ;;
+    --rootfs) ROOTFS="$2"; shift 2 ;;
     --template) TEMPLATE="$2"; shift 2 ;;
     --bridge) BRIDGE_OPT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -138,13 +141,31 @@ prompt_vmid() {
         continue
       fi
       if pct status "$VMID" >/dev/null 2>&1; then
-        echo "ERROR: VMID $VMID already exists (pct status $VMID). Choose another." >&2
-        if [[ -n "${IP_INPUT:-}" && -n "${PRIVILEGED_FLAG:-}" ]]; then
-          # non-interactive: fail
+        echo "WARNING: VMID $VMID already exists!" >&2
+        pct status "$VMID" 2>&1 | sed 's/^/  /' >&2 || true
+        echo "Config: /etc/pve/lxc/${VMID}.conf" >&2
+        cat "/etc/pve/lxc/${VMID}.conf" 2>&1 | head -n 20 | sed 's/^/  /' >&2 || true
+        echo "" >&2
+        # Non-interactive with all flags — require explicit DELETE_IT via prompt still, so fail unless interactive
+        if [[ -n "${IP_INPUT:-}" && -n "${PRIVILEGED_FLAG:-}" && -n "${PASSWORD:-}" ]]; then
+          echo "Non-interactive mode: VMID $VMID exists. Re-run interactively and type DELETE_IT to nuke, or choose another VMID." >&2
           exit 1
         fi
-        VMID=""
-        continue
+        read -rp "VMID $VMID exists — type DELETE_IT to nuke/redeploy, or press Enter to choose another VMID: " ans
+        if [[ "$ans" == "DELETE_IT" ]]; then
+          echo "Destroying existing LXC $VMID ..."
+          pct stop "$VMID" >/dev/null 2>&1 || true
+          # pct destroy vs delete — try both
+          if ! pct destroy "$VMID" 2>&1; then
+            pct delete "$VMID" 2>&1 || true
+          fi
+          echo "Destroyed $VMID — will recreate."
+          break
+        else
+          echo "Not deleting — choose another VMID." >&2
+          VMID=""
+          continue
+        fi
       fi
       break
     fi
@@ -247,19 +268,39 @@ prompt_cores_memory() {
       exit 1
     fi
   fi
+  # Normalize ROOTFS if passed via --rootfs (handles 32, 32G, 32GB)
+  if [[ -n "$ROOTFS" ]]; then
+    ROOTFS="$(echo "$ROOTFS" | tr '[:upper:]' '[:lower:]' | sed 's/gb//;s/g//;s/m//')"
+    if ! [[ "$ROOTFS" =~ ^[0-9]+$ ]] || (( ROOTFS < 4 || ROOTFS > 1024 )); then
+      echo "ERROR: --rootfs must be size in GB (e.g. 32, 32G)" >&2
+      exit 1
+    fi
+  fi
 
   # only prompt if interactive and not set via flags? Keep defaults but allow override
   # If all key flags were provided non-interactively, skip
-  if [[ -n "$VMID" && -n "$IP_CIDR" && -n "$PRIVILEGED_FLAG" && -n "$PASSWORD" && "$GPU_MODE" != "auto" && -n "$CORES" && -n "$MEMORY" ]]; then
+  if [[ -n "$VMID" && -n "$IP_CIDR" && -n "$PRIVILEGED_FLAG" && -n "$PASSWORD" && "$GPU_MODE" != "auto" && -n "$CORES" && -n "$MEMORY" && -n "$ROOTFS" ]]; then
     # non-interactive run with all required — skip interactive prompts
-    # but still normalize MEMORY already done
     return
   fi
-  read -rp "Cores [${CORES}]: " inp; inp="$(echo "${inp:-}" | xargs)"; CORES="${inp:-$CORES}"
 
-  # RAM — GB choices like hlh-ai-engine (4/8/12/16/32), default 16GB
+  # Cores — options with fast enter default (hlh-ai-engine uses 12, default here 8)
+  echo "Cores options: 2, 4, 8, 12, 16 (default: ${CORES} — Enter for fast install)"
+  while true; do
+    read -rp "Cores [${CORES}]: " inp; inp="$(echo "${inp:-$CORES}" | xargs)"
+    if [[ "$inp" =~ ^(2|4|8|12|16)$ ]]; then
+      CORES="$inp"; break
+    elif [[ "$inp" =~ ^[0-9]+$ ]] && (( inp >= 1 && inp <= 32 )); then
+      echo "  Note: standard choices are 2/4/8/12/16 — using ${inp} anyway"
+      CORES="$inp"; break
+    else
+      echo "  Invalid — choose 2, 4, 8, 12, or 16"
+    fi
+  done
+
+  # RAM — GB choices like hlh-ai-engine (4/8/12/16/32), default 16GB, Enter for fast install
   local mem_gb_default=$(( MEMORY / 1024 ))
-  echo "RAM options: 4, 8, 12, 16, 32 GB (storage stays ${DEFAULT_ROOTFS}G on ${DEFAULT_STORAGE} like hlh-ai-engine)"
+  echo "RAM options: 4, 8, 12, 16, 32 GB (default: ${mem_gb_default}GB — Enter for fast install)"
   while true; do
     read -rp "RAM in GB [${mem_gb_default}]: " inp; inp="$(echo "${inp:-$mem_gb_default}" | xargs)"
     # strip gb suffix if user types 16GB
@@ -277,8 +318,22 @@ prompt_cores_memory() {
     fi
   done
 
-  # Storage — default RaidZ1-6TB like hlh-ai-engine (--storage local fails: does not support container directories)
-  # Show available container-capable storages if pvesm exists
+  # Rootfs / Storage size — options 16/32/64/128 GB, default 32G like hlh-ai-engine siblings
+  echo "Storage size options: 16, 32, 64, 128 GB (default: ${ROOTFS}G on ${STORAGE} — Enter for fast install)"
+  while true; do
+    read -rp "Rootfs size GB [${ROOTFS}]: " inp; inp="$(echo "${inp:-$ROOTFS}" | xargs)"
+    inp="$(echo "$inp" | tr '[:upper:]' '[:lower:]' | sed 's/gb//;s/g//')"
+    if [[ "$inp" =~ ^(16|32|64|128)$ ]]; then
+      ROOTFS="$inp"; break
+    elif [[ "$inp" =~ ^[0-9]+$ ]] && (( inp >= 8 && inp <= 1024 )); then
+      echo "  Note: standard choices are 16/32/64/128 — using ${inp}G anyway"
+      ROOTFS="$inp"; break
+    else
+      echo "  Invalid — choose 16, 32, 64, or 128"
+    fi
+  done
+
+  # Storage pool — default RaidZ1-6TB like hlh-ai-engine (--storage local fails: does not support container directories)
   if command -v pvesm >/dev/null 2>&1; then
     echo "  Available storages (container capable):"
     pvesm status 2>&1 | awk 'NR==1 || $3 ~ /rootdir/ || $2 ~ /RaidZ1/' | sed 's/^/    /' || true
@@ -308,7 +363,7 @@ echo "  Hostname    : $HOSTNAME"
 echo "  IP          : $IP_CIDR gw $GATEWAY bridge $BRIDGE_OPT"
 echo "  Privileged  : $PRIVILEGED_FLAG (pct --unprivileged $UNPRIVILEGED) $([[ "$PRIVILEGED_FLAG" == "1" ]] && echo '[for LLM perf]' || echo '[secure]')"
 echo "  Cores/RAM   : ${CORES} cores / ${MEMORY_GB}GB (${MEMORY} MB)"
-echo "  Storage     : $STORAGE (${DEFAULT_ROOTFS}G rootfs on ${STORAGE} — like hlh-ai-engine Pool=RaidZ1-6TB, was 'local' fails)"
+echo "  Storage     : $STORAGE (${ROOTFS}G rootfs on ${STORAGE} — default 32G like hlh-ai-engine)"
 echo "  Template    : $TEMPLATE"
 echo "  GPU mode    : $GPU_MODE"
 echo "  Root PW     : [hidden, will be set via chpasswd]"
@@ -347,7 +402,7 @@ fi
 echo "[1/5] Creating LXC $VMID ..."
 pct create "$VMID" "$TEMPLATE" \
   --storage "$STORAGE" \
-  --rootfs "${DEFAULT_ROOTFS}" \
+  --rootfs "${ROOTFS}" \
   --hostname "$HOSTNAME" \
   --cores "$CORES" \
   --memory "$MEMORY" \
