@@ -33,19 +33,24 @@ Examples:
 EOF
 }
 
+INSIDE_FORCED=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vmid) VMID="$2"; shift 2 ;;
     --ip) IP="$2"; shift 2 ;;
     --rocm) ROCM_VERSION="$2"; shift 2 ;;
     --vllm) VLLM_VERSION="$2"; shift 2 ;;
+    --inside) INSIDE_FORCED=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: Unknown option $1" >&2; usage; exit 1 ;;
   esac
 done
 
 # If running inside LXC (no pct, or systemd-detect-virt), just do inner install
-if ! command -v pct >/dev/null 2>&1 || ! pct status "$VMID" >/dev/null 2>&1 2>&1; then
+if [[ "$INSIDE_FORCED" -eq 1 ]]; then
+  echo "Forced inside mode via --inside (ROCM $ROCM_VERSION)"
+  INSIDE=1
+elif ! command -v pct >/dev/null 2>&1 || ! pct status "$VMID" >/dev/null 2>&1 2>&1; then
   if systemd-detect-virt 2>/dev/null | grep -qi lxc; then
     echo "Detected running INSIDE LXC — doing direct install (ROCM $ROCM_VERSION)"
     INSIDE=1
