@@ -399,7 +399,7 @@ if [[ ! -e "/var/lib/vz/template/cache/$(basename "${TEMPLATE#*:}")" ]] && ! pve
   fi
 fi
 
-echo "[1/5] Creating LXC $VMID ..."
+echo "[1/6] Creating LXC $VMID ..."
 pct create "$VMID" "$TEMPLATE" \
   --storage "$STORAGE" \
   --rootfs "${ROOTFS}" \
@@ -417,7 +417,7 @@ cp "$CONF" "${CONF}.bak.$(date +%s)"
 echo "Backed up $CONF -> ${CONF}.bak.*"
 
 # --- GPU passthrough ---
-echo "[2/5] Configuring GPU passthrough (mode=$GPU_MODE) ..."
+echo "[2/6] Configuring GPU passthrough (mode=$GPU_MODE) ..."
 # Always add apparmor unconfined for GPU access (needed for both amd/nvidia, privileged or not)
 if ! grep -q "lxc.apparmor.profile" "$CONF"; then
   echo "lxc.apparmor.profile: unconfined" >> "$CONF"
@@ -504,12 +504,12 @@ echo "LXC config $CONF:"
 cat "$CONF"
 echo ""
 
-echo "[3/5] Starting LXC $VMID ..."
+echo "[3/6] Starting LXC $VMID ..."
 pct start "$VMID"
 sleep 5
 pct status "$VMID"
 
-echo "[4/5] Setting root password ..."
+echo "[4/6] Setting root password ..."
 # Robust password set: push temp file to avoid shell escaping issues with special chars
 TMP_PW="$(mktemp)"
 printf 'root:%s\n' "$PASSWORD" > "$TMP_PW"
@@ -525,17 +525,46 @@ else
     lxc-attach -n "$VMID" -- bash -c 'printf "%s:%s\n" "root" "$1" | chpasswd' _ "$PASSWORD" || true
 fi
 shred -u "$TMP_PW" 2>/dev/null || rm -f "$TMP_PW"
-# Clear password from shell history / env
+# Keep PASSWORD for SSH test until after SSH config, then clear
+# (do not unset yet — need for test below, will unset after SSH step)
+
+echo "[5/6] Configuring SSH for root like hlh-ai-engine (PermitRootLogin yes, PasswordAuthentication yes) ..."
+# Like hlh-ai-engine/ansible/files/configure-ai-engine-inside-lxc.sh:187-195
+# — installs openssh-server, allows root login with password, enables service
+pct exec "$VMID" -- bash -c '
+  set -e
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y --no-install-recommends openssh-server 2>&1 | tail -20
+  usermod -aG render root 2>/dev/null || true
+  usermod -aG video root 2>/dev/null || true
+  mkdir -p /etc/ssh/sshd_config.d
+  cat > /etc/ssh/sshd_config.d/99-root-login.conf <<EOF
+PermitRootLogin yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication no
+UsePAM yes
+EOF
+  # Ensure sshd_config includes Include directive (Ubuntu 24.04 does by default)
+  systemctl enable ssh 2>&1 | tail -5 || systemctl enable sshd 2>&1 | tail -5 || true
+  systemctl restart ssh 2>&1 | tail -20 || systemctl restart sshd 2>&1 | tail -20 || service ssh restart 2>&1 | tail -20 || true
+  echo "SSH configured: $(cat /etc/ssh/sshd_config.d/99-root-login.conf)"
+  ss -tlnp 2>&1 | grep -E ":22" | head -5 || netstat -tlnp 2>&1 | grep -E ":22" | head -5 || true
+' || echo "WARNING: SSH setup failed (will still try to continue — check pct exec $VMID -- systemctl status ssh)" >&2
+
+# Now safe to clear password
 unset PASSWORD PASSWORD2 TMP_PW
 
-echo "[5/5] Verifying ..."
+echo "[6/6] Verifying (GPU + SSH) ..."
 pct exec "$VMID" -- bash -c 'ls -l /dev/dri 2>&1; echo "---"; ls -l /dev/kfd /dev/nvidia* 2>&1; echo "---"; cat /proc/mounts 2>&1 | grep -E "dri|kfd|nvidia" | head -20' || true
+pct exec "$VMID" -- bash -c 'echo "--- SSH ---"; cat /etc/ssh/sshd_config.d/99-root-login.conf 2>&1; echo "---"; systemctl is-active ssh 2>&1 || systemctl is-active sshd 2>&1 || service ssh status 2>&1 | head -20; ss -tlnp 2>&1 | grep :22 | head -5 || true' || true
 
 echo ""
 echo "=== Done ==="
 echo "LXC $VMID ($HOSTNAME) at $IP_ADDR created (privileged=$PRIVILEGED_FLAG, gpu=$GPU_MODE)"
 echo "  pct enter $VMID"
 echo "  pct exec $VMID -- bash"
+echo "  ssh root@$IP_ADDR  # like hlh-ai-engine: PermitRootLogin yes + PasswordAuthentication yes (99-root-login.conf)"
 echo "  Inside LXC:  rocminfo | head -n 50   # AMD"
 echo "  Inside LXC:  nvidia-smi             # NVIDIA"
 echo "  Inside LXC:  ls -l /dev/dri /dev/kfd /dev/nvidia*"
