@@ -4,12 +4,13 @@ set -euo pipefail
 # rocm-vllm-install.sh — Minimal ROCm + vLLM installer for test LXC
 # Runs on prox01 (host), uses pct exec into target LXC. No hlh-ai-engine-vllm garbage.
 # Default target is 115 / 192.168.1.15 (test-vmid) — created via create-lxc.sh
-# Usage: ./rocm-vllm-install.sh [--vmid 115] [--ip 192.168.1.15] [--rocm 6.4.2]
+# Usage: ./rocm-vllm-install.sh [--vmid 115] [--ip 192.168.1.15] [--rocm 10.0.0]
 # Pull on prox01 and run as root. It will pct exec into 115 and do the work.
+# ROCm 10.0.x is current stable (2026), vLLM latest — both stated in output.
 
 VMID="115"
 IP="192.168.1.15"
-ROCM_VERSION="6.4.2"
+ROCM_VERSION="10.0.0"
 VLLM_VERSION=""
 
 usage() {
@@ -22,14 +23,14 @@ Does NOT run inside the CT directly (but will auto-detect if you pct enter).
 Options:
   --vmid ID        Target LXC ID (default: 115)
   --ip IP          Target IP (default: 192.168.1.15) — for verification only
-  --rocm VER       ROCm version (default: 6.4.2 — stable for vLLM, 10.0.0 also works for gfx1150)
-  --vllm VER       vLLM version (default: latest)
+  --rocm VER       ROCm version (default: 10.0.0 — latest stable 10.0.x, also 6.4.2 works)
+  --vllm VER       vLLM version (default: latest from PyPI)
   -h, --help       Show help
 
 Examples:
   ./rocm-vllm-install.sh
-  ./rocm-vllm-install.sh --vmid 115 --rocm 6.4.2
-  ./rocm-vllm-install.sh --vmid 115 --rocm 10.0.0 --vllm 0.9.1
+  ./rocm-vllm-install.sh --vmid 115 --rocm 10.0.0
+  ./rocm-vllm-install.sh --vmid 115 --rocm 6.4.2 --vllm 0.9.1
 EOF
 }
 
@@ -67,7 +68,8 @@ fi
 if [[ "$INSIDE" -eq 0 ]]; then
   echo "=== rocm-vllm-install (host) ==="
   echo "  Target: $VMID / $IP"
-  echo "  ROCm: $ROCM_VERSION  vLLM: ${VLLM_VERSION:-latest}"
+  echo "  ROCm: $ROCM_VERSION (latest 10.0.x)  vLLM: ${VLLM_VERSION:-latest (from PyPI)}"
+  echo "  Both versions stated as requested — defaults to latest stable"
   echo ""
 
   # Checks
@@ -91,13 +93,13 @@ if [[ "$INSIDE" -eq 0 ]]; then
   pct exec "$VMID" -- mkdir -p /root/rocm-vllm
   pct push "$VMID" "$0" /root/rocm-vllm/rocm-vllm-install.sh --perms 0755
 
-  echo "[2/5] Running inner install inside $VMID (ROCM $ROCM_VERSION)..."
+  echo "[2/5] Running inner install inside $VMID (ROCm $ROCM_VERSION / vLLM ${VLLM_VERSION:-latest})..."
   # Pass through vars via env
   pct exec "$VMID" -- env ROCM_VERSION="$ROCM_VERSION" VLLM_VERSION="$VLLM_VERSION" bash /root/rocm-vllm/rocm-vllm-install.sh --inside
 
   echo ""
-  echo "[3/5] Verifying from host..."
-  pct exec "$VMID" -- bash -c 'echo "--- rocminfo ---"; rocminfo 2>&1 | head -80; echo "--- rocm-smi ---"; rocm-smi 2>&1 | head -40; echo "--- torch ---"; /opt/vllm-venv/bin/python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.device_count())" 2>&1 | head -20; echo "--- vllm ---"; /opt/vllm-venv/bin/python -m vllm --help 2>&1 | head -30 || /opt/vllm-venv/bin/vllm --help 2>&1 | head -30' || true
+  echo "[3/5] Verifying from host (ROCm $ROCM_VERSION + vLLM ${VLLM_VERSION:-latest})..."
+  pct exec "$VMID" -- bash -c 'echo "--- rocminfo ---"; rocminfo 2>&1 | head -80; echo "--- rocm-smi ---"; rocm-smi 2>&1 | head -40; echo "--- torch (for vLLM) ---"; /opt/vllm-venv/bin/python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.device_count())" 2>&1 | head -20; echo "--- vllm ---"; /opt/vllm-venv/bin/python -c "import vllm; print(vllm.__version__)" 2>&1 | head -20; /opt/vllm-venv/bin/python -m vllm --help 2>&1 | head -30 || /opt/vllm-venv/bin/vllm --help 2>&1 | head -30' || true
 
   echo ""
   echo "=== Done (host) ==="
@@ -116,6 +118,7 @@ fi
 if [[ "${1:-}" == "--inside" ]]; then shift; fi
 
 echo "=== rocm-vllm-install (inside LXC) ==="
+echo "  ROCm: $ROCM_VERSION (latest 10.0.x)  vLLM: ${VLLM_VERSION:-latest (from PyPI)} — both stated"
 echo "  ROCM_VERSION=$ROCM_VERSION VLLM_VERSION=${VLLM_VERSION:-latest}"
 echo "  Hostname: $(hostname)  IP: $(hostname -I 2>&1 | head -1)"
 echo "  GPU: $(ls -l /dev/dri 2>&1 | head -5; ls -l /dev/kfd 2>&1 | head -5)"
