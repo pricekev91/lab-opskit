@@ -8,10 +8,11 @@ set -euo pipefail
 BRIDGE="vmbr0"
 GATEWAY="192.168.1.1"
 DEFAULT_TEMPLATE="local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst"
-DEFAULT_STORAGE="local"
+DEFAULT_STORAGE="RaidZ1-6TB"
 DEFAULT_ROOTFS="32"
 DEFAULT_CORES="8"
-DEFAULT_MEMORY="32768"
+DEFAULT_MEMORY_MB="16384"
+DEFAULT_MEMORY_GB="16"
 DEFAULT_HOSTNAME_PREFIX="ai-engine"
 
 usage() {
@@ -29,8 +30,8 @@ Options:
   --password PASS           root password (otherwise prompted securely)
   --gpu MODE                amd|nvidia|both|none|auto (default: auto=both if devices exist)
   --cores N                 CPU cores (default: 8)
-  --memory MB               RAM in MB (default: 32768)
-  --storage POOL            Proxmox storage (default: local)
+  --memory GB|MB            RAM — GB choices 4/8/12/16/32 (default: 16GB). Accepts 16, 16GB, or 16384
+  --storage POOL            Proxmox storage (default: RaidZ1-6TB — like hlh-ai-engine)
   --template TPL            Template (default: local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst)
   --bridge BR               Bridge (default: vmbr0)
   -h, --help                Show this help
@@ -52,7 +53,7 @@ PRIVILEGED_FLAG="" # 0 or 1 if set
 PASSWORD=""
 GPU_MODE="auto"
 CORES="$DEFAULT_CORES"
-MEMORY="$DEFAULT_MEMORY"
+MEMORY="$DEFAULT_MEMORY_MB"
 STORAGE="$DEFAULT_STORAGE"
 TEMPLATE="$DEFAULT_TEMPLATE"
 BRIDGE_OPT="$BRIDGE"
@@ -101,6 +102,20 @@ normalize_ip() {
   # reject .0, .255, .1 gateway
   if (( octet == 0 || octet == 255 )); then return 1; fi
   echo "192.168.1.${octet}/24"
+}
+
+normalize_memory_to_mb() {
+  local inp="$1"
+  inp="$(echo "$inp" | tr '[:upper:]' '[:lower:]' | xargs)"
+  inp="${inp//gb/}"; inp="${inp//g/}"; inp="${inp//mb/}"; inp="${inp//m/}"
+  inp="$(echo "$inp" | xargs)"
+  if ! [[ "$inp" =~ ^[0-9]+$ ]]; then return 1; fi
+  # if value <=64 assume GB, else MB — but prefer explicit: 4/8/12/16/32 are GB, >100 are MB
+  if (( inp <= 64 )); then
+    echo $(( inp * 1024 ))
+  else
+    echo "$inp"
+  fi
 }
 
 need_pct() {
@@ -225,13 +240,49 @@ prompt_gpu() {
 }
 
 prompt_cores_memory() {
+  # Normalize MEMORY if passed via --memory flag (handles 16, 16GB, 16384)
+  if [[ -n "$MEMORY" ]]; then
+    if ! MEMORY="$(normalize_memory_to_mb "$MEMORY" 2>/dev/null)"; then
+      echo "ERROR: --memory must be 4/8/12/16/32 or MB (e.g. 16, 16GB, 16384)" >&2
+      exit 1
+    fi
+  fi
+
   # only prompt if interactive and not set via flags? Keep defaults but allow override
-  if [[ -n "$VMID" && -n "$IP_CIDR" && -n "$PRIVILEGED_FLAG" && -n "$PASSWORD" && "$GPU_MODE" != "auto" ]]; then
-    # non-interactive run, skip
+  # If all key flags were provided non-interactively, skip
+  if [[ -n "$VMID" && -n "$IP_CIDR" && -n "$PRIVILEGED_FLAG" && -n "$PASSWORD" && "$GPU_MODE" != "auto" && -n "$CORES" && -n "$MEMORY" ]]; then
+    # non-interactive run with all required — skip interactive prompts
+    # but still normalize MEMORY already done
     return
   fi
   read -rp "Cores [${CORES}]: " inp; inp="$(echo "${inp:-}" | xargs)"; CORES="${inp:-$CORES}"
-  read -rp "Memory MB [${MEMORY}]: " inp; inp="$(echo "${inp:-}" | xargs)"; MEMORY="${inp:-$MEMORY}"
+
+  # RAM — GB choices like hlh-ai-engine (4/8/12/16/32), default 16GB
+  local mem_gb_default=$(( MEMORY / 1024 ))
+  echo "RAM options: 4, 8, 12, 16, 32 GB (storage stays ${DEFAULT_ROOTFS}G on ${DEFAULT_STORAGE} like hlh-ai-engine)"
+  while true; do
+    read -rp "RAM in GB [${mem_gb_default}]: " inp; inp="$(echo "${inp:-$mem_gb_default}" | xargs)"
+    # strip gb suffix if user types 16GB
+    inp="$(echo "$inp" | tr '[:upper:]' '[:lower:]' | sed 's/gb//;s/g//')"
+    if [[ "$inp" =~ ^(4|8|12|16|32)$ ]]; then
+      MEMORY=$(( inp * 1024 ))
+      break
+    elif [[ "$inp" =~ ^[0-9]+$ ]] && (( inp >= 1 && inp <= 64 )); then
+      # allow other GB values if user insists
+      echo "  Note: standard choices are 4/8/12/16/32 — using ${inp}GB anyway"
+      MEMORY=$(( inp * 1024 ))
+      break
+    else
+      echo "  Invalid — choose 4, 8, 12, 16, or 32"
+    fi
+  done
+
+  # Storage — default RaidZ1-6TB like hlh-ai-engine (--storage local fails: does not support container directories)
+  # Show available container-capable storages if pvesm exists
+  if command -v pvesm >/dev/null 2>&1; then
+    echo "  Available storages (container capable):"
+    pvesm status 2>&1 | awk 'NR==1 || $3 ~ /rootdir/ || $2 ~ /RaidZ1/' | sed 's/^/    /' || true
+  fi
   read -rp "Storage [${STORAGE}]: " inp; inp="$(echo "${inp:-}" | xargs)"; STORAGE="${inp:-$STORAGE}"
   read -rp "Template [${TEMPLATE}]: " inp; inp="$(echo "${inp:-}" | xargs)"; TEMPLATE="${inp:-$TEMPLATE}"
 }
@@ -249,14 +300,15 @@ prompt_cores_memory
 UNPRIVILEGED="1"
 if [[ "$PRIVILEGED_FLAG" == "1" ]]; then UNPRIVILEGED="0"; fi
 
+MEMORY_GB=$(( MEMORY / 1024 ))
 echo ""
 echo "=== Summary ==="
 echo "  VMID        : $VMID"
 echo "  Hostname    : $HOSTNAME"
 echo "  IP          : $IP_CIDR gw $GATEWAY bridge $BRIDGE_OPT"
 echo "  Privileged  : $PRIVILEGED_FLAG (pct --unprivileged $UNPRIVILEGED) $([[ "$PRIVILEGED_FLAG" == "1" ]] && echo '[for LLM perf]' || echo '[secure]')"
-echo "  Cores/Mem   : ${CORES} / ${MEMORY} MB"
-echo "  Storage     : $STORAGE (${DEFAULT_ROOTFS}G rootfs)"
+echo "  Cores/RAM   : ${CORES} cores / ${MEMORY_GB}GB (${MEMORY} MB)"
+echo "  Storage     : $STORAGE (${DEFAULT_ROOTFS}G rootfs on ${STORAGE} — like hlh-ai-engine Pool=RaidZ1-6TB, was 'local' fails)"
 echo "  Template    : $TEMPLATE"
 echo "  GPU mode    : $GPU_MODE"
 echo "  Root PW     : [hidden, will be set via chpasswd]"
@@ -271,8 +323,8 @@ if [[ "$confirm" != "y" && "$confirm" != "yes" ]]; then
   exit 0
 fi
 
-# Check template exists
-if [[ ! -e "/var/lib/vz/template/cache/$(basename "${TEMPLATE#*:}")" ]] && ! pveam list "$STORAGE" 2>&1 | grep -q "$(basename "${TEMPLATE#*:}")"; then
+# Check template exists (templates live on 'local', not on RaidZ1-6TB)
+if [[ ! -e "/var/lib/vz/template/cache/$(basename "${TEMPLATE#*:}")" ]] && ! pveam list local 2>&1 | grep -q "$(basename "${TEMPLATE#*:}")"; then
   echo "WARNING: Template $TEMPLATE not found in /var/lib/vz/template/cache" >&2
   echo "Available:"
   pveam available 2>&1 | grep -i ubuntu | head -20 || true
