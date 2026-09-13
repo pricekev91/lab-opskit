@@ -143,61 +143,72 @@ apt-get install -y --no-install-recommends \
 GFX_VERSION="11.0.0"
 echo "GFX override: $GFX_VERSION (890M gfx1150)"
 
-echo "[2/4] ROCm $ROCM_VERSION repo + install..."
+echo "[2/4] ROCm $ROCM_VERSION repo + install (latest 10.0.x)..."
+echo "  Requested ROCm: $ROCM_VERSION + vLLM: ${VLLM_VERSION:-latest} — both stated"
 mkdir -p /etc/apt/keyrings
 ROCM_MAJOR="$(echo "$ROCM_VERSION" | cut -d. -f1)"
-# Decide repo: 10.x -> stable.repo.amd.com, else legacy multi-arch (6.x, 7.x)
-if [[ "$ROCM_MAJOR" -ge 10 ]] 2>/dev/null; then
-  echo "Using stable.repo.amd.com for ROCm 10.x"
-  wget -qO - https://stable.repo.amd.com/rocm/gpg/packages.gpg | gpg --dearmor > /etc/apt/keyrings/amdrocm.gpg
-  echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://stable.repo.amd.com/rocm/core/packages/ubuntu2404 stable main" > /etc/apt/sources.list.d/rocm.list
-  echo -e "Package: *\nPin: origin stable.repo.amd.com\nPin-Priority: 1001" > /etc/apt/preferences.d/rocm-pin
+
+# Use amdgpu-install deb — official quick-start (https://rocm.docs.amd.com/en/latest/install/quick_start.html)
+# For Ubuntu 24.04 noble: amdgpu-install_7.2.4... for latest, or 6.4.2 installer for 6.4
+# This handles repo + keyring automatically, then apt install rocm (no dkms in LXC)
+AMDGPU_INSTALL_DEB="/tmp/amdgpu-install.deb"
+AMDGPU_INSTALL_URL=""
+if [[ "$ROCM_MAJOR" -ge 10 ]] || [[ "$ROCM_VERSION" == 10* ]]; then
+  AMDGPU_INSTALL_URL="https://repo.radeon.com/amdgpu-install/7.2.4/ubuntu/noble/amdgpu-install_7.2.4.70204-1_all.deb"
+  echo "Using amdgpu-install 7.2.4 for ROCm 10.x (stable, noble)"
+elif [[ "$ROCM_VERSION" == 6.4* ]]; then
+  AMDGPU_INSTALL_URL="https://repo.radeon.com/amdgpu-install/6.4.2/ubuntu/noble/amdgpu-install_6.4.60204-1_all.deb"
+  echo "Using amdgpu-install 6.4.2 for ROCm 6.4.x"
+elif [[ "$ROCM_MAJOR" -eq 6 ]]; then
+  AMDGPU_INSTALL_URL="https://repo.radeon.com/amdgpu-install/6.4.1/ubuntu/noble/amdgpu-install_6.4.60103-1_all.deb"
+  echo "Using amdgpu-install 6.4.1 for ROCm 6.x"
 else
-  echo "Using repo.amd.com multi-arch for ROCm 6.x/7.x"
-  wget -qO - https://repo.amd.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdrocm.gpg 2>/dev/null || \
-    wget -qO - https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg | gpg --dearmor > /etc/apt/keyrings/amdrocm.gpg
-  echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/apt/6.4 ubuntu main" > /etc/apt/sources.list.d/rocm.list
-  # fallback for older path
-  if ! apt-get update 2>&1 | tail -5; then
-    echo "Trying legacy path..."
-    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/apt/6.4 jammy main" > /etc/apt/sources.list.d/rocm.list || true
-    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages-multi-arch/ubuntu2404 stable main" > /etc/apt/sources.list.d/rocm.list || true
+  AMDGPU_INSTALL_URL="https://repo.radeon.com/amdgpu-install/7.2.4/ubuntu/noble/amdgpu-install_7.2.4.70204-1_all.deb"
+  echo "Using amdgpu-install 7.2.4 fallback for $ROCM_VERSION"
+fi
+
+echo "Downloading $AMDGPU_INSTALL_URL ..."
+if wget -qO "$AMDGPU_INSTALL_DEB" "$AMDGPU_INSTALL_URL"; then
+  echo "Installing amdgpu-install deb..."
+  apt-get install -y "$AMDGPU_INSTALL_DEB" || dpkg -i "$AMDGPU_INSTALL_DEB" || true
+  apt-get update || apt-get update -o Acquire::AllowInsecureRepositories=true || true
+else
+  echo "WARNING: amdgpu-install download failed, falling back to manual repo"
+  # Fallback manual repo for 10.x: stable.repo.amd.com
+  if [[ "$ROCM_MAJOR" -ge 10 ]]; then
+    wget -qO - https://stable.repo.amd.com/rocm/gpg/packages.gpg | gpg --dearmor > /etc/apt/keyrings/amdrocm.gpg || true
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://stable.repo.amd.com/rocm/core/packages/ubuntu2404 stable main" > /etc/apt/sources.list.d/rocm.list
+  else
+    wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdrocm.gpg 2>/dev/null || \
+      wget -qO - https://repo.amd.com/rocm/packages-multi-arch/gpg/rocm.gpg | gpg --dearmor > /etc/apt/keyrings/amdrocm.gpg || true
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION}/ubuntu noble main" > /etc/apt/sources.list.d/rocm.list || \
+      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.radeon.com/rocm/apt/6.4.2/ubuntu noble main" > /etc/apt/sources.list.d/rocm.list
   fi
-  echo -e "Package: *\nPin: origin repo.amd.com\nPin-Priority: 1001" > /etc/apt/preferences.d/rocm-pin || true
-fi
-echo 'APT::Key::GPGCommand "/usr/bin/gpg";' > /etc/apt/apt.conf.d/99gpg-override 2>/dev/null || true
-
-# Try update, install rocm
-apt-get update || apt-get update -o Acquire::AllowInsecureRepositories=true || true
-
-# Install ROCm — try versioned then generic
-ROCM_MM="$(echo "$ROCM_VERSION" | cut -d. -f1,2)"
-echo "Installing ROCm packages for $ROCM_VERSION (MM=$ROCM_MM)..."
-# Clean old rocminfo that conflicts
-apt-get remove -y rocminfo 2>/dev/null || true
-
-# For 6.4, packages are rocm-dev, rocm-smi-lib, rocminfo etc, not amdrocm
-if [[ "$ROCM_MAJOR" -eq 6 ]] || [[ "$ROCM_MAJOR" -eq 7 ]]; then
-  echo "Installing ROCm 6.x/7.x stack (rocm-dev)..."
-  apt-get install -y --no-install-recommends rocm-dev rocm-smi-lib rocminfo 2>&1 | tail -30 || \
-    apt-get install -y --no-install-recommends rocm 2>&1 | tail -30 || {
-      echo "Trying amdrocm fallback..."
-      apt-get install -y --no-install-recommends "amdrocm${ROCM_MM}" 2>&1 | tail -30 || true
-    }
-else
-  # 10.x uses amdrocm
-  apt-get install -y --no-install-recommends "amdrocm${ROCM_MM}-gfx1150" "amdrocm-core-dev${ROCM_MM}-gfx1150" 2>&1 | tail -30 || \
-    apt-get install -y --no-install-recommends "amdrocm${ROCM_MM}" "amdrocm-core-dev${ROCM_MM}" 2>&1 | tail -30 || \
-    apt-get install -y --no-install-recommends rocm-dev 2>&1 | tail -30 || true
+  echo 'APT::Key::GPGCommand "/usr/bin/gpg";' > /etc/apt/apt.conf.d/99gpg-override 2>/dev/null || true
+  apt-get update || true
 fi
 
-# Env
-echo "Setting up ROCm env..."
+# Install ROCm — minimal stack for LXC (no dkms)
+echo "Installing ROCm (apt install rocm) for $ROCM_VERSION..."
+# amdgpu-install deb already added repo, now install
+apt-get install -y --no-install-recommends rocm 2>&1 | tail -50 || {
+  echo "rocm meta failed, trying rocm-dev..."
+  apt-get install -y --no-install-recommends rocm-dev rocminfo rocm-smi-lib 2>&1 | tail -50 || {
+    echo "Trying amdrocm fallback..."
+    ROCM_MM="$(echo "$ROCM_VERSION" | cut -d. -f1,2)"
+    apt-get install -y --no-install-recommends "amdrocm${ROCM_MM}" 2>&1 | tail -30 || true
+  }
+}
+# Also ensure rocminfo present
+apt-get install -y rocminfo 2>&1 | tail -20 || true
+
+# Env — fix unbound variable with :- 
+echo "Setting up ROCm env (HSA_OVERRIDE_GFX_VERSION=$GFX_VERSION)..."
 cat > /etc/profile.d/rocm.sh << EOF
 export ROCM_PATH=$ROCM_PATH
 export HIP_PATH=$ROCM_PATH
 export PATH=\$PATH:$ROCM_PATH/bin:$ROCM_PATH/llvm/bin
-export LD_LIBRARY_PATH=$ROCM_PATH/lib:\$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=\$ROCM_PATH/lib:\${LD_LIBRARY_PATH:-}
 export HSA_OVERRIDE_GFX_VERSION=$GFX_VERSION
 EOF
 # shellcheck disable=SC1091
