@@ -10,9 +10,9 @@ GATEWAY="192.168.1.1"
 DEFAULT_TEMPLATE="local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst"
 DEFAULT_STORAGE="RaidZ1-6TB"
 DEFAULT_ROOTFS="32"
-DEFAULT_CORES="8"
-DEFAULT_MEMORY_MB="16384"
-DEFAULT_MEMORY_GB="16"
+DEFAULT_CORES="4"
+DEFAULT_MEMORY_MB="4096"
+DEFAULT_MEMORY_GB="4"
 DEFAULT_HOSTNAME_PREFIX="test"
 
 usage() {
@@ -29,10 +29,10 @@ Options:
   --privileged / --unprivileged  privileged=1 for performance/LLM (default: prompt, privileged=yes)
   --password PASS           root password (otherwise prompted securely)
   --gpu MODE                amd|nvidia|both|none|auto (default: auto=both if devices exist)
-  --cores N                 CPU cores (default: 8 — options 2/4/8/12)
-  --memory GB|MB            RAM — GB choices 4/8/12/16/32 (default: 16GB). Accepts 16, 16GB, or 16384
+  --cores N                 CPU cores (default: 4 — options 4/8)
+  --memory GB|MB            RAM — GB choices 2/4/6/8 (default: 4GB). Accepts 4, 4GB, or 4096
   --storage POOL            Proxmox storage (default: RaidZ1-6TB — like hlh-ai-engine)
-  --rootfs GB               Rootfs size in GB (options 16/32/64/128, default: 32G)
+  --rootfs GB               Rootfs size in GB (default: 32G — enter any GB like 50)
   --template TPL            Template (default: local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst)
   --bridge BR               Bridge (default: vmbr0)
   -h, --help                Show this help
@@ -261,75 +261,68 @@ prompt_gpu() {
 }
 
 prompt_cores_memory() {
-  # Normalize MEMORY if passed via --memory flag (handles 16, 16GB, 16384)
+  # Normalize MEMORY if passed via --memory flag (handles 2/4/6/8, 4GB, 4096)
   if [[ -n "$MEMORY" ]]; then
     if ! MEMORY="$(normalize_memory_to_mb "$MEMORY" 2>/dev/null)"; then
-      echo "ERROR: --memory must be 4/8/12/16/32 or MB (e.g. 16, 16GB, 16384)" >&2
+      echo "ERROR: --memory must be 2/4/6/8 or MB (e.g. 4, 4GB, 4096)" >&2
       exit 1
     fi
   fi
-  # Normalize ROOTFS if passed via --rootfs (handles 32, 32G, 32GB)
+  # Normalize ROOTFS if passed via --rootfs (handles 32, 32G, 32GB, 50)
   if [[ -n "$ROOTFS" ]]; then
     ROOTFS="$(echo "$ROOTFS" | tr '[:upper:]' '[:lower:]' | sed 's/gb//;s/g//;s/m//')"
     if ! [[ "$ROOTFS" =~ ^[0-9]+$ ]] || (( ROOTFS < 4 || ROOTFS > 1024 )); then
-      echo "ERROR: --rootfs must be size in GB (e.g. 32, 32G)" >&2
+      echo "ERROR: --rootfs must be size in GB (e.g. 32, 50, 32G)" >&2
       exit 1
     fi
   fi
 
   # only prompt if interactive and not set via flags? Keep defaults but allow override
-  # If all key flags were provided non-interactively, skip
   if [[ -n "$VMID" && -n "$IP_CIDR" && -n "$PRIVILEGED_FLAG" && -n "$PASSWORD" && "$GPU_MODE" != "auto" && -n "$CORES" && -n "$MEMORY" && -n "$ROOTFS" ]]; then
-    # non-interactive run with all required — skip interactive prompts
     return
   fi
 
-  # Cores — options with fast enter default (hlh-ai-engine uses 12, default here 8)
-  echo "Cores options: 2, 4, 8, 12, 16 (default: ${CORES} — Enter for fast install)"
+  # Cores — 4/8 with 4 default, Enter for fast install
+  echo "Cores options: 4, 8 (default: ${CORES} — Enter for fast install)"
   while true; do
     read -rp "Cores [${CORES}]: " inp; inp="$(echo "${inp:-$CORES}" | xargs)"
-    if [[ "$inp" =~ ^(2|4|8|12|16)$ ]]; then
+    if [[ "$inp" =~ ^(4|8)$ ]]; then
       CORES="$inp"; break
     elif [[ "$inp" =~ ^[0-9]+$ ]] && (( inp >= 1 && inp <= 32 )); then
-      echo "  Note: standard choices are 2/4/8/12/16 — using ${inp} anyway"
+      echo "  Note: usual choices are 4/8 — using ${inp} anyway"
       CORES="$inp"; break
     else
-      echo "  Invalid — choose 2, 4, 8, 12, or 16"
+      echo "  Invalid — choose 4 or 8 (or 1-32)"
     fi
   done
 
-  # RAM — GB choices like hlh-ai-engine (4/8/12/16/32), default 16GB, Enter for fast install
+  # RAM — 2/4/6/8 GB, default 4GB, Enter for fast install
   local mem_gb_default=$(( MEMORY / 1024 ))
-  echo "RAM options: 4, 8, 12, 16, 32 GB (default: ${mem_gb_default}GB — Enter for fast install)"
+  echo "RAM options: 2, 4, 6, 8 GB (default: ${mem_gb_default}GB — Enter for fast install)"
   while true; do
     read -rp "RAM in GB [${mem_gb_default}]: " inp; inp="$(echo "${inp:-$mem_gb_default}" | xargs)"
-    # strip gb suffix if user types 16GB
     inp="$(echo "$inp" | tr '[:upper:]' '[:lower:]' | sed 's/gb//;s/g//')"
-    if [[ "$inp" =~ ^(4|8|12|16|32)$ ]]; then
+    if [[ "$inp" =~ ^(2|4|6|8)$ ]]; then
       MEMORY=$(( inp * 1024 ))
       break
     elif [[ "$inp" =~ ^[0-9]+$ ]] && (( inp >= 1 && inp <= 64 )); then
-      # allow other GB values if user insists
-      echo "  Note: standard choices are 4/8/12/16/32 — using ${inp}GB anyway"
+      echo "  Note: usual choices are 2/4/6/8 — using ${inp}GB anyway"
       MEMORY=$(( inp * 1024 ))
       break
     else
-      echo "  Invalid — choose 4, 8, 12, 16, or 32"
+      echo "  Invalid — choose 2, 4, 6, or 8"
     fi
   done
 
-  # Rootfs / Storage size — options 16/32/64/128 GB, default 32G like hlh-ai-engine siblings
-  echo "Storage size options: 16, 32, 64, 128 GB (default: ${ROOTFS}G on ${STORAGE} — Enter for fast install)"
+  # Rootfs / Storage size — default 32G, allow any GB like 50
+  echo "Disk size: default ${ROOTFS}G on ${STORAGE} — Enter for fast install, or type any GB like 50"
   while true; do
     read -rp "Rootfs size GB [${ROOTFS}]: " inp; inp="$(echo "${inp:-$ROOTFS}" | xargs)"
     inp="$(echo "$inp" | tr '[:upper:]' '[:lower:]' | sed 's/gb//;s/g//')"
-    if [[ "$inp" =~ ^(16|32|64|128)$ ]]; then
-      ROOTFS="$inp"; break
-    elif [[ "$inp" =~ ^[0-9]+$ ]] && (( inp >= 8 && inp <= 1024 )); then
-      echo "  Note: standard choices are 16/32/64/128 — using ${inp}G anyway"
+    if [[ "$inp" =~ ^[0-9]+$ ]] && (( inp >= 8 && inp <= 1024 )); then
       ROOTFS="$inp"; break
     else
-      echo "  Invalid — choose 16, 32, 64, or 128"
+      echo "  Invalid — enter number 8-1024 (e.g. 32, 50, 64)"
     fi
   done
 
@@ -530,27 +523,61 @@ shred -u "$TMP_PW" 2>/dev/null || rm -f "$TMP_PW"
 
 echo "[5/6] Configuring SSH for root like hlh-ai-engine (PermitRootLogin yes, PasswordAuthentication yes) ..."
 # Like hlh-ai-engine/ansible/files/configure-ai-engine-inside-lxc.sh:187-195
-# — installs openssh-server, allows root login with password, enables service
+# Use printf not heredoc inside pct exec to avoid quoting issues
 pct exec "$VMID" -- bash -c '
   set -e
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y --no-install-recommends openssh-server 2>&1 | tail -20
+  echo "Waiting for network in LXC..."
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W2 8.8.8.8 >/dev/null 2>&1 || getent hosts archive.ubuntu.com >/dev/null 2>&1; then
+      echo "Network up after $i tries"
+      break
+    fi
+    echo "  no network yet, try $i/10 — sleep 2"
+    sleep 2
+  done
+  echo "APT update..."
+  apt-get update
+  echo "Installing openssh-server..."
+  apt-get install -y --no-install-recommends openssh-server
   usermod -aG render root 2>/dev/null || true
   usermod -aG video root 2>/dev/null || true
   mkdir -p /etc/ssh/sshd_config.d
-  cat > /etc/ssh/sshd_config.d/99-root-login.conf <<EOF
-PermitRootLogin yes
-PasswordAuthentication yes
-KbdInteractiveAuthentication no
-UsePAM yes
-EOF
-  # Ensure sshd_config includes Include directive (Ubuntu 24.04 does by default)
+  printf "PermitRootLogin yes\nPasswordAuthentication yes\nKbdInteractiveAuthentication no\nUsePAM yes\n" > /etc/ssh/sshd_config.d/99-root-login.conf
+  echo "Wrote /etc/ssh/sshd_config.d/99-root-login.conf:"
+  cat /etc/ssh/sshd_config.d/99-root-login.conf
+  # Also ensure main sshd_config has Include (Ubuntu 24.04 does, but verify)
+  grep -q "Include /etc/ssh/sshd_config.d" /etc/ssh/sshd_config || echo "Include /etc/ssh/sshd_config.d/*.conf" >> /etc/ssh/sshd_config
+  # Validate config
+  sshd -t && echo "sshd -t OK" || { echo "sshd -t FAILED"; cat /etc/ssh/sshd_config; cat /etc/ssh/sshd_config.d/*.conf; }
+  echo "Effective sshd config:"
+  sshd -T 2>&1 | grep -Ei "permitroot|passwordauth|port " | head -20
+  # Enable and start — try systemctl, then service, then direct sshd
+  systemctl daemon-reload 2>&1 | tail -5 || true
   systemctl enable ssh 2>&1 | tail -5 || systemctl enable sshd 2>&1 | tail -5 || true
-  systemctl restart ssh 2>&1 | tail -20 || systemctl restart sshd 2>&1 | tail -20 || service ssh restart 2>&1 | tail -20 || true
-  echo "SSH configured: $(cat /etc/ssh/sshd_config.d/99-root-login.conf)"
-  ss -tlnp 2>&1 | grep -E ":22" | head -5 || netstat -tlnp 2>&1 | grep -E ":22" | head -5 || true
-' || echo "WARNING: SSH setup failed (will still try to continue — check pct exec $VMID -- systemctl status ssh)" >&2
+  if ! systemctl restart ssh 2>&1 | tail -20; then
+    systemctl restart sshd 2>&1 | tail -20 || service ssh restart 2>&1 | tail -20 || /usr/sbin/sshd 2>&1 | tail -20 || true
+  fi
+  sleep 2
+  echo "systemctl status:"
+  systemctl is-active ssh 2>&1 || systemctl is-active sshd 2>&1 || service ssh status 2>&1 | head -30 || true
+  echo "ss listening:"
+  ss -tlnp 2>&1 | grep -E ":22" | head -10 || netstat -tlnp 2>&1 | grep -E ":22" | head -10 || ss -tln 2>&1 | head -20
+  echo "journalctl ssh:"
+  journalctl -u ssh --no-pager -n 30 2>&1 | tail -30 || journalctl -u sshd --no-pager -n 30 2>&1 | tail -30 || true
+' || echo "WARNING: SSH setup failed (check pct exec $VMID -- systemctl status ssh; journalctl -u ssh)" >&2
+
+# Host-side check: try to reach port 22 from Proxmox host (not inside LXC)
+echo "Host-side SSH check for $IP_ADDR:22 ..."
+if command -v nc >/dev/null 2>&1; then
+  nc -vz -w5 "$IP_ADDR" 22 2>&1 || echo "  nc failed — sshd not yet reachable from host"
+elif command -v ncat >/dev/null 2>&1; then
+  ncat -vz -w5 "$IP_ADDR" 22 2>&1 || true
+else
+  timeout 5 bash -c "cat < /dev/null > /dev/tcp/$IP_ADDR/22 && echo \"  TCP connect OK\" || echo \"  TCP connect failed\"" 2>&1 || true
+fi
+# Also verify inside LXC that 127.0.0.1:22 works
+pct exec "$VMID" -- bash -c "ss -tlnp 2>&1 | grep 22; systemctl is-active ssh 2>&1; sshd -T 2>&1 | grep -i permit" 2>&1 | sed "s/^/  LXC ssh: /" || true
 
 # Now safe to clear password
 unset PASSWORD PASSWORD2 TMP_PW
