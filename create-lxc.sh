@@ -59,6 +59,10 @@ ROOTFS="$DEFAULT_ROOTFS"
 STORAGE="$DEFAULT_STORAGE"
 TEMPLATE="$DEFAULT_TEMPLATE"
 BRIDGE_OPT="$BRIDGE"
+# Track if --cores/--memory/--rootfs were explicitly passed via CLI (vs defaults)
+CORES_SET=0
+MEMORY_SET=0
+ROOTFS_SET=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -69,10 +73,10 @@ while [[ $# -gt 0 ]]; do
     --unprivileged) PRIVILEGED_FLAG="0"; shift ;;
     --password) PASSWORD="$2"; shift 2 ;;
     --gpu) GPU_MODE="$2"; shift 2 ;;
-    --cores) CORES="$2"; shift 2 ;;
-    --memory) MEMORY="$2"; shift 2 ;;
+    --cores) CORES="$2"; CORES_SET=1; shift 2 ;;
+    --memory) MEMORY="$2"; MEMORY_SET=1; shift 2 ;;
     --storage) STORAGE="$2"; shift 2 ;;
-    --rootfs) ROOTFS="$2"; shift 2 ;;
+    --rootfs) ROOTFS="$2"; ROOTFS_SET=1; shift 2 ;;
     --template) TEMPLATE="$2"; shift 2 ;;
     --bridge) BRIDGE_OPT="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -261,14 +265,14 @@ prompt_gpu() {
 }
 
 prompt_cores_memory() {
-  # Normalize MEMORY if passed via --memory flag (handles 2/4/6/8, 4GB, 4096)
+  # Normalize MEMORY if set (handles 2/4/6/8, 4GB, 4096) — only normalize if explicitly passed or default
   if [[ -n "$MEMORY" ]]; then
     if ! MEMORY="$(normalize_memory_to_mb "$MEMORY" 2>/dev/null)"; then
       echo "ERROR: --memory must be 2/4/6/8 or MB (e.g. 4, 4GB, 4096)" >&2
       exit 1
     fi
   fi
-  # Normalize ROOTFS if passed via --rootfs (handles 32, 32G, 32GB, 50)
+  # Normalize ROOTFS if set (handles 32, 32G, 32GB, 50)
   if [[ -n "$ROOTFS" ]]; then
     ROOTFS="$(echo "$ROOTFS" | tr '[:upper:]' '[:lower:]' | sed 's/gb//;s/g//;s/m//')"
     if ! [[ "$ROOTFS" =~ ^[0-9]+$ ]] || (( ROOTFS < 4 || ROOTFS > 1024 )); then
@@ -277,9 +281,12 @@ prompt_cores_memory() {
     fi
   fi
 
-  # only prompt if interactive and not set via flags? Keep defaults but allow override
-  if [[ -n "$VMID" && -n "$IP_CIDR" && -n "$PRIVILEGED_FLAG" && -n "$PASSWORD" && "$GPU_MODE" != "auto" && -n "$CORES" && -n "$MEMORY" && -n "$ROOTFS" ]]; then
-    return
+  # Only skip prompts if ALL of cores/memory/rootfs were explicitly passed via CLI + other required fields set (non-interactive)
+  # Previously this checked -n CORES/MEMORY/ROOTFS which is always true due to defaults, so it never prompted (bug)
+  if [[ "$CORES_SET" == 1 && "$MEMORY_SET" == 1 && "$ROOTFS_SET" == 1 ]]; then
+    if [[ -n "$VMID" && -n "$IP_CIDR" && -n "$PRIVILEGED_FLAG" && -n "$PASSWORD" && "$GPU_MODE" != "auto" ]]; then
+      return
+    fi
   fi
 
   # Cores — 4/8 with 4 default, Enter for fast install
