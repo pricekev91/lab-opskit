@@ -32,7 +32,7 @@ Options:
   --cores N                 CPU cores (default: 4 — options 4/8)
   --memory GB|MB            RAM — GB choices 2/4/6/8 (default: 4GB). Accepts 4, 4GB, or 4096
   --storage POOL            Proxmox storage (default: RaidZ1-6TB — like hlh-ai-engine)
-  --rootfs GB               Rootfs size in GB (default: 32G — enter any GB like 50)
+  --rootfs GB               Rootfs size in GB (default: 32G — options 25/50/75 or any GB like 50)
   --template TPL            Template (default: local:vztmpl/ubuntu-24.04-standard_24.04-2_amd64.tar.zst)
   --bridge BR               Bridge (default: vmbr0)
   -h, --help                Show this help
@@ -314,15 +314,18 @@ prompt_cores_memory() {
     fi
   done
 
-  # Rootfs / Storage size — default 32G, allow any GB like 50
-  echo "Disk size: default ${ROOTFS}G on ${STORAGE} — Enter for fast install, or type any GB like 50"
+  # Rootfs / Storage size — default 32G, allow 25/50/75 or any GB like 50
+  echo "Disk size options: 25, 50, 75 GB (default: ${ROOTFS}G on ${STORAGE} — Enter for fast, or type any GB like 50)"
   while true; do
     read -rp "Rootfs size GB [${ROOTFS}]: " inp; inp="$(echo "${inp:-$ROOTFS}" | xargs)"
     inp="$(echo "$inp" | tr '[:upper:]' '[:lower:]' | sed 's/gb//;s/g//')"
-    if [[ "$inp" =~ ^[0-9]+$ ]] && (( inp >= 8 && inp <= 1024 )); then
+    if [[ "$inp" =~ ^(25|50|75)$ ]]; then
+      ROOTFS="$inp"; break
+    elif [[ "$inp" =~ ^[0-9]+$ ]] && (( inp >= 8 && inp <= 1024 )); then
+      echo "  Note: standard choices are 25/50/75 — using ${inp}GB anyway (manual)"
       ROOTFS="$inp"; break
     else
-      echo "  Invalid — enter number 8-1024 (e.g. 32, 50, 64)"
+      echo "  Invalid — enter number 8-1024 (e.g. 25, 50, 75)"
     fi
   done
 
