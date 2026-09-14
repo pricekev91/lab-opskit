@@ -188,19 +188,34 @@ else
   apt-get update || true
 fi
 
-# Install ROCm — minimal stack for LXC (no dkms)
-echo "Installing ROCm (apt install rocm) for $ROCM_VERSION..."
-# amdgpu-install deb already added repo, now install
-apt-get install -y --no-install-recommends rocm 2>&1 | tail -50 || {
-  echo "rocm meta failed, trying rocm-dev..."
-  apt-get install -y --no-install-recommends rocm-dev rocminfo rocm-smi-lib 2>&1 | tail -50 || {
-    echo "Trying amdrocm fallback..."
+# Install ROCm — minimal stack for LXC (no dkms) — show live progress, not tail
+echo "Installing ROCm (apt install rocm) for $ROCM_VERSION... this downloads ~3-6GB and takes 5-15min, showing live apt progress"
+echo "  Packages: rocm (meta) -> pulls hip, rocm-core, rocblas, etc for gfx1150"
+# amdgpu-install deb already added repo, now install — stream output via tee so you see progress
+set +e
+apt-get install -y --no-install-recommends rocm 2>&1 | tee /tmp/rocm-apt.log; ROEXIT=${PIPESTATUS[0]}
+if [[ $ROEXIT -ne 0 ]]; then
+  echo "rocm meta failed (exit $ROEXIT), trying rocm-dev... see /tmp/rocm-apt.log"
+  cat /tmp/rocm-apt.log | tail -100
+  apt-get install -y --no-install-recommends rocm-dev rocminfo rocm-smi-lib 2>&1 | tee /tmp/rocm-apt2.log; ROEXIT2=${PIPESTATUS[0]}
+  if [[ $ROEXIT2 -ne 0 ]]; then
+    echo "rocm-dev also failed (exit $ROEXIT2), trying amdrocm fallback... see /tmp/rocm-apt2.log"
+    cat /tmp/rocm-apt2.log | tail -100
     ROCM_MM="$(echo "$ROCM_VERSION" | cut -d. -f1,2)"
-    apt-get install -y --no-install-recommends "amdrocm${ROCM_MM}" 2>&1 | tail -30 || true
-  }
-}
-# Also ensure rocminfo present
-apt-get install -y rocminfo 2>&1 | tail -20 || true
+    apt-get install -y --no-install-recommends "amdrocm${ROCM_MM}" 2>&1 | tee /tmp/rocm-apt3.log || true
+    cat /tmp/rocm-apt3.log | tail -100 || true
+  fi
+else
+  echo "rocm install finished (exit $ROEXIT), tail of log:"
+  tail -50 /tmp/rocm-apt.log
+fi
+set -e
+# Also ensure rocminfo present — show what was installed
+echo "Ensuring rocminfo..."
+apt-get install -y rocminfo 2>&1 | tee /tmp/rocminfo.log | tail -30 || true
+echo "Installed ROCm packages (dpkg -l | grep rocm):"
+dpkg -l | grep -E "rocm|hip|hsa" | head -n 30 || true
+echo "Disk after ROCm: $(df -h / | awk 'NR==2{print $4\" free\"}')"
 
 # Env — fix unbound variable with :- 
 echo "Setting up ROCm env (HSA_OVERRIDE_GFX_VERSION=$GFX_VERSION)..."
@@ -231,26 +246,34 @@ python3 -m venv "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 pip install --upgrade pip wheel setuptools
 
-# Install torch ROCm — vLLM needs torch with ROCm
-# Use ROCm 6.4 wheel for 6.4.2, nightly for 10.x fallback to 6.4
-echo "Installing torch ROCm..."
+# Install torch ROCm — vLLM needs torch with ROCm — show live pip progress
+echo "Installing torch ROCm... this downloads ~4.5GB torch+triton, takes 3-10min, showing pip progress"
 if [[ "$ROCM_MAJOR" -ge 10 ]]; then
-  echo "ROCm 10.x — trying torch nightly ROCm 6.4 fallback (10.x not yet in torch stable)"
-  pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/rocm6.4 "torch==2.8.0" "torchaudio==2.8.0" 2>&1 | tail -20 || \
-    pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/rocm6.2 "torch" "torchaudio" 2>&1 | tail -20 || \
-    pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/rocm6.4 2>&1 | tail -20 || true
+  echo "ROCm 10.x — trying torch nightly ROCm 6.4 fallback (10.x not yet in torch stable) — will show download MB/s"
+  pip install --no-cache-dir --index-url https://download.pytorch.org/whl/rocm6.4 torch==2.9.1+rocm6.4 torchaudio==2.9.1+rocm6.4 2>&1 | tee /tmp/torch-pip.log || \
+    pip install --no-cache-dir --index-url https://download.pytorch.org/whl/rocm6.2 torch torchaudio 2>&1 | tee /tmp/torch-pip.log || true
+  tail -50 /tmp/torch-pip.log || true
 else
-  pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/rocm6.4 "torch==2.8.0" 2>&1 | tail -20 || \
-    pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/rocm6.4 2>&1 | tail -20 || true
+  pip install --no-cache-dir --index-url https://download.pytorch.org/whl/rocm6.4 torch==2.9.1+rocm6.4 torchaudio==2.9.1+rocm6.4 2>&1 | tee /tmp/torch-pip.log || \
+    pip install --no-cache-dir --index-url https://download.pytorch.org/whl/rocm6.4 torch torchaudio 2>&1 | tee /tmp/torch-pip.log || true
+  tail -50 /tmp/torch-pip.log || true
 fi
-python -c "import torch; print('torch', torch.__version__); print('cuda avail', torch.cuda.is_available())" 2>&1 | tail -20 || true
+# Fix vLLM overwriting torch with CUDA (reinstall ROCm torch after vLLM)
+echo "torch after first install:"
+python -c "import torch; print('torch', torch.__version__); print('hip', torch.version.hip); print('cuda avail', torch.cuda.is_available())" 2>&1 | tail -20 || true
 
-echo "Installing vLLM..."
+echo "Installing vLLM (latest ${VLLM_VERSION:-from PyPI})... this downloads ~1GB, showing pip progress"
 if [[ -n "$VLLM_VERSION" ]]; then
-  pip install --no-cache-dir "vllm==$VLLM_VERSION" 2>&1 | tail -30 || true
+  pip install --no-cache-dir "vllm==$VLLM_VERSION" 2>&1 | tee /tmp/vllm-pip.log || true
 else
-  pip install --no-cache-dir vllm 2>&1 | tail -30 || true
+  pip install --no-cache-dir vllm 2>&1 | tee /tmp/vllm-pip.log || true
 fi
+tail -50 /tmp/vllm-pip.log || true
+echo "Reinstalling torch ROCm after vLLM (vLLM pulls CUDA torch, we need ROCm)..."
+pip install --no-cache-dir --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/rocm6.4 torch==2.9.1+rocm6.4 2>&1 | tee /tmp/torch-fix.log | tail -50 || true
+pip install --no-cache-dir --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/rocm6.4 torchaudio==2.9.1+rocm6.4 2>&1 | tee -a /tmp/torch-fix.log | tail -20 || true
+echo "torch after fix:"
+python -c "import torch; print('torch', torch.__version__); print('hip', torch.version.hip); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no hip device')" 2>&1 | tail -20 || true
 # Verify
 python -c "import vllm; print('vllm', vllm.__version__)" 2>&1 | tail -20 || echo "vllm import failed"
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'no cuda')" 2>&1 | tail -20 || true
