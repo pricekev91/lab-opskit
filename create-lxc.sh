@@ -14,6 +14,8 @@ DEFAULT_CORES="4"
 DEFAULT_MEMORY_MB="4096"
 DEFAULT_MEMORY_GB="4"
 DEFAULT_HOSTNAME_PREFIX="test"
+MODEL_HOST_DIR="/srv/ai/models"
+MODEL_LXC_DIR="/srv/ai/models"
 
 usage() {
   cat <<'EOF'
@@ -367,6 +369,7 @@ echo "  IP          : $IP_CIDR gw $GATEWAY bridge $BRIDGE_OPT"
 echo "  Privileged  : $PRIVILEGED_FLAG (pct --unprivileged $UNPRIVILEGED) $([[ "$PRIVILEGED_FLAG" == "1" ]] && echo '[for LLM perf]' || echo '[secure]')"
 echo "  Cores/RAM   : ${CORES} cores / ${MEMORY_GB}GB (${MEMORY} MB)"
 echo "  Storage     : $STORAGE (${ROOTFS}G rootfs on ${STORAGE} — default 32G like hlh-ai-engine)"
+echo "  Model mount : $MODEL_HOST_DIR -> $MODEL_LXC_DIR (mp0, RaidZ1-6TB/ai/models, Qwen3.5-9B-safetensors 18G)"
 echo "  Template    : $TEMPLATE"
 echo "  GPU mode    : $GPU_MODE"
 echo "  Root PW     : [hidden, will be set via chpasswd]"
@@ -402,7 +405,11 @@ if [[ ! -e "/var/lib/vz/template/cache/$(basename "${TEMPLATE#*:}")" ]] && ! pve
   fi
 fi
 
-echo "[1/6] Creating LXC $VMID ..."
+echo "[1/6] Creating LXC $VMID (with model bind-mount $MODEL_HOST_DIR -> $MODEL_LXC_DIR)..."
+# Ensure model host dir exists like hlh-ai-engine:226 (RaidZ1-6TB dataset, 775)
+mkdir -p "$MODEL_HOST_DIR" 2>&1 | head
+chown 0:0 "$MODEL_HOST_DIR" 2>&1 | head || true
+chmod 775 "$MODEL_HOST_DIR" 2>&1 | head || true
 pct create "$VMID" "$TEMPLATE" \
   --storage "$STORAGE" \
   --rootfs "${ROOTFS}" \
@@ -413,7 +420,8 @@ pct create "$VMID" "$TEMPLATE" \
   --features nesting=1,keyctl=1 \
   --net0 "name=eth0,bridge=${BRIDGE_OPT},ip=${IP_CIDR},gw=${GATEWAY}" \
   --unprivileged "$UNPRIVILEGED" \
-  --onboot 1
+  --onboot 1 \
+  --mp0 "${MODEL_HOST_DIR},mp=${MODEL_LXC_DIR}"
 
 CONF="/etc/pve/lxc/${VMID}.conf"
 cp "$CONF" "${CONF}.bak.$(date +%s)"
@@ -599,9 +607,11 @@ pct exec "$VMID" -- bash -c 'echo "--- SSH ---"; cat /etc/ssh/sshd_config.d/99-r
 echo ""
 echo "=== Done ==="
 echo "LXC $VMID ($HOSTNAME) at $IP_ADDR created (privileged=$PRIVILEGED_FLAG, gpu=$GPU_MODE)"
+echo "  Model mount: $MODEL_HOST_DIR (host) -> $MODEL_LXC_DIR (mp0, Qwen3.5-9B-safetensors 18G already on host)"
 echo "  pct enter $VMID"
 echo "  pct exec $VMID -- bash"
 echo "  ssh root@$IP_ADDR  # like hlh-ai-engine: PermitRootLogin yes + PasswordAuthentication yes (99-root-login.conf)"
+echo "  pct exec $VMID -- ls -lh $MODEL_LXC_DIR/Qwen3.5-9B-safetensors"
 echo "  Inside LXC:  rocminfo | head -n 50   # AMD"
 echo "  Inside LXC:  nvidia-smi             # NVIDIA"
 echo "  Inside LXC:  ls -l /dev/dri /dev/kfd /dev/nvidia*"

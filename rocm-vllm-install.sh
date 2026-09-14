@@ -12,6 +12,7 @@ VMID="115"
 IP="192.168.1.15"
 ROCM_VERSION="10.0.0"
 VLLM_VERSION=""
+MODEL="/srv/ai/models/Qwen3.5-9B-safetensors"
 
 usage() {
   cat <<'EOF'
@@ -25,12 +26,14 @@ Options:
   --ip IP          Target IP (default: 192.168.1.15) — for verification only
   --rocm VER       ROCm version (default: 10.0.0 — latest stable 10.0.x, also 6.4.2 works)
   --vllm VER       vLLM version (default: latest from PyPI)
+  --model PATH     Model path (default: /srv/ai/models/Qwen3.5-9B-safetensors — bind-mounted from host)
   -h, --help       Show help
 
 Examples:
   ./rocm-vllm-install.sh
   ./rocm-vllm-install.sh --vmid 115 --rocm 10.0.0
   ./rocm-vllm-install.sh --vmid 115 --rocm 6.4.2 --vllm 0.9.1
+  ./rocm-vllm-install.sh --vmid 115 --model /srv/ai/models/Qwen3.5-9B-safetensors
 EOF
 }
 
@@ -41,6 +44,7 @@ while [[ $# -gt 0 ]]; do
     --ip) IP="$2"; shift 2 ;;
     --rocm) ROCM_VERSION="$2"; shift 2 ;;
     --vllm) VLLM_VERSION="$2"; shift 2 ;;
+    --model) MODEL="$2"; shift 2 ;;
     --inside) INSIDE_FORCED=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: Unknown option $1" >&2; usage; exit 1 ;;
@@ -93,9 +97,9 @@ if [[ "$INSIDE" -eq 0 ]]; then
   pct exec "$VMID" -- mkdir -p /root/rocm-vllm
   pct push "$VMID" "$0" /root/rocm-vllm/rocm-vllm-install.sh --perms 0755
 
-  echo "[2/5] Running inner install inside $VMID (ROCm $ROCM_VERSION / vLLM ${VLLM_VERSION:-latest})..."
+  echo "[2/5] Running inner install inside $VMID (ROCm $ROCM_VERSION / vLLM ${VLLM_VERSION:-latest} / Model $MODEL)..."
   # Pass through vars via env
-  pct exec "$VMID" -- env ROCM_VERSION="$ROCM_VERSION" VLLM_VERSION="$VLLM_VERSION" bash /root/rocm-vllm/rocm-vllm-install.sh --inside
+  pct exec "$VMID" -- env ROCM_VERSION="$ROCM_VERSION" VLLM_VERSION="$VLLM_VERSION" MODEL="$MODEL" bash /root/rocm-vllm/rocm-vllm-install.sh --inside
 
   echo ""
   echo "[3/5] Verifying from host (ROCm $ROCM_VERSION + vLLM ${VLLM_VERSION:-latest})..."
@@ -106,8 +110,9 @@ if [[ "$INSIDE" -eq 0 ]]; then
   echo "Test inside LXC:"
   echo "  pct exec $VMID -- bash -c 'rocminfo | head -20; rocm-smi'"
   echo "  pct exec $VMID -- /opt/vllm-venv/bin/python -c 'import torch; print(torch.cuda.is_available())'"
+  echo "  pct exec $VMID -- ls -lh $MODEL"
   echo "  ssh root@$IP  # then same checks"
-  echo "  Inside LXC vLLM run: HSA_OVERRIDE_GFX_VERSION=11.0.0 /opt/vllm-venv/bin/vllm serve --model Qwen/Qwen2.5-0.5B-Instruct --port 8000"
+  echo "  Inside LXC vLLM run: HSA_OVERRIDE_GFX_VERSION=11.0.0 /opt/vllm-venv/bin/vllm serve --model $MODEL --host 0.0.0.0 --port 8000 --dtype half"
   exit 0
 fi
 
@@ -118,10 +123,12 @@ fi
 if [[ "${1:-}" == "--inside" ]]; then shift; fi
 
 echo "=== rocm-vllm-install (inside LXC) ==="
-echo "  ROCm: $ROCM_VERSION (latest 10.0.x)  vLLM: ${VLLM_VERSION:-latest (from PyPI)} — both stated"
-echo "  ROCM_VERSION=$ROCM_VERSION VLLM_VERSION=${VLLM_VERSION:-latest}"
+echo "  ROCm: $ROCM_VERSION (latest 10.0.x)  vLLM: ${VLLM_VERSION:-latest (from PyPI)}  Model: $MODEL — all stated"
+echo "  ROCM_VERSION=$ROCM_VERSION VLLM_VERSION=${VLLM_VERSION:-latest} MODEL=$MODEL"
 echo "  Hostname: $(hostname)  IP: $(hostname -I 2>&1 | head -1)"
 echo "  GPU: $(ls -l /dev/dri 2>&1 | head -5; ls -l /dev/kfd 2>&1 | head -5)"
+echo "  Model bind-mount check: ls -lh $MODEL 2>&1 | head -n 20 || echo 'Model not found at $MODEL (bind-mount missing?)'"
+ls -lh "$MODEL" 2>&1 | head -n 20 || echo "Model not found at $MODEL"
 cat /etc/os-release | grep PRETTY_NAME || true
 echo ""
 
@@ -290,5 +297,7 @@ deactivate 2>/dev/null || true
 
 echo ""
 echo "=== rocm-vllm-install (inside) done ==="
-echo "Test: HSA_OVERRIDE_GFX_VERSION=$GFX_VERSION /opt/vllm-venv/bin/vllm serve --model Qwen/Qwen2.5-0.5B-Instruct --port 8000 --dtype auto"
+echo "Model: $MODEL (bind-mounted from host, already verified)"
+echo "Test: HSA_OVERRIDE_GFX_VERSION=$GFX_VERSION /opt/vllm-venv/bin/vllm serve --model $MODEL --host 0.0.0.0 --port 8000 --dtype half --gpu-memory-utilization 0.7"
 echo "Or: /opt/vllm-venv/bin/python -c 'import torch; print(torch.cuda.is_available())'"
+echo "Verify: curl http://127.0.0.1:8000/v1/models 2>&1 | head"
